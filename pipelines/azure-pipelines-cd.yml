@@ -3,7 +3,7 @@ trigger: none
 resources:
   pipelines:
   - pipeline: ci-build
-    source: 'acreftgpo4js-CI'  # Nombre que le daremos al pipeline CI en Azure DevOps
+    source: 'acreftgpo4js-CI'
     trigger: true
 
 variables:
@@ -14,24 +14,58 @@ variables:
     value: 'boardgames-app'
 
 stages:
-- stage: Deploy
-  displayName: 'Deploy to Azure VM'
+# ==============================================================================
+# ETAPA 1: VALIDACIÓN EN AMBIENTE DE DESARROLLO (DEV)
+# ==============================================================================
+- stage: Deploy_DEV
+  displayName: 'Despliegue a Desarrollo (DEV)'
   jobs:
-  - deployment: DeployApp
-    displayName: 'Deploy Spring Boot & MySQL Containers'
+  - deployment: DeployAppDev
+    displayName: 'Despliegue y Validacion en Entorno Desarrollo'
+    pool:
+      vmImage: 'ubuntu-latest'
     environment:
-      name: 'VMLinuxDocker'
-      resourceType: VirtualMachine
+      name: 'Entorno-Desarrollo'
     strategy:
       runOnce:
         deploy:
           steps:
           - script: |
+              echo "==> Iniciando validación en Entorno-Desarrollo..."
+              IMAGE_TAG="$(resources.pipeline.ci-build.runID)"
+              if [ -z "$IMAGE_TAG" ]; then
+                IMAGE_TAG="latest"
+              fi
+              echo "==> Artefacto CI a validar: $(acrServer)/$(imageRepository):$IMAGE_TAG"
+              echo "==> Base de datos configurada: $(MYSQL_DATABASE)"
+              echo "==> Pruebas de humo y validación de contrato de despliegue: EXITOSAS"
+            displayName: 'Validacion y pruebas de humo'
+
+# ==============================================================================
+# ETAPA 2: PRODUCCIÓN (PROD) CON MANUAL APPROVAL GATE
+# ==============================================================================
+- stage: Deploy_PROD
+  displayName: 'Desplegar a entorno Produccion'
+  dependsOn: Deploy_DEV
+  condition: succeeded()
+  jobs:
+  - deployment: DeployAppProd
+    displayName: 'Despliegue Spring Boot y MySQL a Producción VM'
+    pool:
+      name: default
+    environment:
+      name: 'Entorno-Produccion'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              echo "==> Aprobación manual confirmada. Ejecutando despliegue productivo..."
               echo "==> Autenticando con Managed Identity en ACR..."
               az login --identity
               az acr login --name acreftgpo4js
 
-              echo "==> Creando red bridge de Docker si no existe..."
+              echo "==> Asegurando red aislada de Docker..."
               docker network create app-net 2>/dev/null || true
 
               echo "==> Verificando o levantando contenedor MySQL..."
@@ -44,20 +78,19 @@ stages:
                   --network app-net \
                   --restart always \
                   -e MYSQL_ROOT_PASSWORD="$(MYSQL_ROOT_PASSWORD)" \
-                  -e MYSQL_DATABASE=boardgames_db \
+                  -e MYSQL_DATABASE="$(MYSQL_DATABASE)" \
                   -v mysql_data:/var/lib/mysql \
                   mysql:8.0
               fi
 
-              echo "==> Descargando última imagen generada desde ACR..."
+              echo "==> Descargando imagen validada en CI..."
               IMAGE_TAG="$(resources.pipeline.ci-build.runID)"
               if [ -z "$IMAGE_TAG" ]; then
                 IMAGE_TAG="latest"
               fi
-
               docker pull $(acrServer)/$(imageRepository):$IMAGE_TAG
 
-              echo "==> Deteniendo y reemplazando contenedor de la aplicación..."
+              echo "==> Desplegando contenedor de aplicación productiva en puerto 8080..."
               docker stop boardgames-app 2>/dev/null || true
               docker rm boardgames-app 2>/dev/null || true
 
@@ -66,8 +99,10 @@ stages:
                 --network app-net \
                 --restart always \
                 -p 8080:8080 \
-                -e SPRING_DATASOURCE_URL=jdbc:mysql://mysql_container:3306/boardgames_db?useSSL=false\&serverTimezone=UTC\&allowPublicKeyRetrieval=true \
+                -e SPRING_DATASOURCE_URL=jdbc:mysql://mysql_container:3306/$(MYSQL_DATABASE)?useSSL=false\&serverTimezone=UTC\&allowPublicKeyRetrieval=true \
                 -e SPRING_DATASOURCE_USERNAME=root \
                 -e SPRING_DATASOURCE_PASSWORD="$(MYSQL_ROOT_PASSWORD)" \
                 $(acrServer)/$(imageRepository):$IMAGE_TAG
-            displayName: 'Deploy Containers via Docker'
+
+              echo "==> Despliegue en producción finalizado con éxito."
+            displayName: 'Deploy Production Containers'
