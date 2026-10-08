@@ -1,0 +1,73 @@
+trigger: none
+
+resources:
+  pipelines:
+  - pipeline: ci-build
+    source: 'acreftgpo4js-CI'  # Nombre que le daremos al pipeline CI en Azure DevOps
+    trigger: true
+
+variables:
+  - group: vg-eft-mysql
+  - name: acrServer
+    value: 'acreftgpo4js.azurecr.io'
+  - name: imageRepository
+    value: 'boardgames-app'
+
+stages:
+- stage: Deploy
+  displayName: 'Deploy to Azure VM'
+  jobs:
+  - deployment: DeployApp
+    displayName: 'Deploy Spring Boot & MySQL Containers'
+    environment:
+      name: 'VMLinuxDocker'
+      resourceType: VirtualMachine
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              echo "==> Autenticando con Managed Identity en ACR..."
+              az login --identity
+              az acr login --name acreftgpo4js
+
+              echo "==> Creando red bridge de Docker si no existe..."
+              docker network create app-net 2>/dev/null || true
+
+              echo "==> Verificando o levantando contenedor MySQL..."
+              if [ ! "$(docker ps -q -f name=mysql_container)" ]; then
+                if [ "$(docker ps -aq -f name=mysql_container)" ]; then
+                  docker rm -f mysql_container
+                fi
+                docker run -d \
+                  --name mysql_container \
+                  --network app-net \
+                  --restart always \
+                  -e MYSQL_ROOT_PASSWORD="$(MYSQL_ROOT_PASSWORD)" \
+                  -e MYSQL_DATABASE=boardgames_db \
+                  -v mysql_data:/var/lib/mysql \
+                  mysql:8.0
+              fi
+
+              echo "==> Descargando última imagen generada desde ACR..."
+              IMAGE_TAG="$(resources.pipeline.ci-build.runID)"
+              if [ -z "$IMAGE_TAG" ]; then
+                IMAGE_TAG="latest"
+              fi
+
+              docker pull $(acrServer)/$(imageRepository):$IMAGE_TAG
+
+              echo "==> Deteniendo y reemplazando contenedor de la aplicación..."
+              docker stop boardgames-app 2>/dev/null || true
+              docker rm boardgames-app 2>/dev/null || true
+
+              docker run -d \
+                --name boardgames-app \
+                --network app-net \
+                --restart always \
+                -p 8080:8080 \
+                -e SPRING_DATASOURCE_URL=jdbc:mysql://mysql_container:3306/boardgames_db?useSSL=false\&serverTimezone=UTC\&allowPublicKeyRetrieval=true \
+                -e SPRING_DATASOURCE_USERNAME=root \
+                -e SPRING_DATASOURCE_PASSWORD="$(MYSQL_ROOT_PASSWORD)" \
+                $(acrServer)/$(imageRepository):$IMAGE_TAG
+            displayName: 'Deploy Containers via Docker'
