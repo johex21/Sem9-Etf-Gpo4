@@ -21,7 +21,7 @@ stages:
   displayName: 'Despliegue a Desarrollo (DEV)'
   jobs:
   - deployment: DeployAppDev
-    displayName: 'Despliegue y Validacion en Entorno Desarrollo'
+    displayName: 'Despliegue y Validacion en Entorno DEV'
     pool:
       vmImage: 'ubuntu-latest'
     environment:
@@ -38,71 +38,52 @@ stages:
               fi
               echo "==> Artefacto CI a validar: $(acrServer)/$(imageRepository):$IMAGE_TAG"
               echo "==> Base de datos configurada: $(MYSQL_DATABASE)"
-              echo "==> Pruebas de humo y validación de contrato de despliegue: EXITOSAS"
-            displayName: 'Validacion y pruebas de humo'
+              echo "==> Validaciones en DEV: OK"
+            displayName: 'Pruebas de Validacion DEV'
 
 # ==============================================================================
-# ETAPA 2: PRODUCCIÓN (PROD) CON MANUAL APPROVAL GATE
+# ETAPA 2: PRODUCCIÓN (PROD) CON MANUAL APPROVAL GATE Y DOCKER COMPOSE
 # ==============================================================================
 - stage: Deploy_PROD
-  displayName: 'Desplegar a entorno Produccion'
+  displayName: 'Desplegar en Produccion'
   dependsOn: Deploy_DEV
   condition: succeeded()
   jobs:
   - deployment: DeployAppProd
     displayName: 'Despliegue Spring Boot y MySQL a Producción VM'
-    pool:
-      name: default
     environment:
       name: 'Entorno-Produccion'
+      resourceType: VirtualMachine
+      resourceName: 'vm-eftgpo4js'
     strategy:
       runOnce:
         deploy:
           steps:
+          - checkout: self
           - script: |
-              echo "==> Aprobación manual confirmada. Ejecutando despliegue productivo..."
+              echo "==> Aprobación manual confirmada. Iniciando orquestación con Docker Compose..."
               echo "==> Autenticando con Managed Identity en ACR..."
               az login --identity
               az acr login --name acreftgpo4js
 
-              echo "==> Asegurando red aislada de Docker..."
-              docker network create app-net 2>/dev/null || true
-
-              echo "==> Verificando o levantando contenedor MySQL..."
-              if [ ! "$(docker ps -q -f name=mysql_container)" ]; then
-                if [ "$(docker ps -aq -f name=mysql_container)" ]; then
-                  docker rm -f mysql_container
-                fi
-                docker run -d \
-                  --name mysql_container \
-                  --network app-net \
-                  --restart always \
-                  -e MYSQL_ROOT_PASSWORD="$(MYSQL_ROOT_PASSWORD)" \
-                  -e MYSQL_DATABASE="$(MYSQL_DATABASE)" \
-                  -v mysql_data:/var/lib/mysql \
-                  mysql:8.0
-              fi
-
-              echo "==> Descargando imagen validada en CI..."
               IMAGE_TAG="$(resources.pipeline.ci-build.runID)"
               if [ -z "$IMAGE_TAG" ]; then
                 IMAGE_TAG="latest"
               fi
+
+              echo "==> Exportando variables de entorno requeridas por docker-compose.yml..."
+              export ACR_SERVER="$(acrServer)"
+              export IMAGE_REPOSITORY="$(imageRepository)"
+              export IMAGE_TAG="$IMAGE_TAG"
+              export MYSQL_DATABASE="$(MYSQL_DATABASE)"
+              export MYSQL_ROOT_PASSWORD="$(MYSQL_ROOT_PASSWORD)"
+
+              echo "==> Descargando imagen inmutable validada en CI..."
               docker pull $(acrServer)/$(imageRepository):$IMAGE_TAG
 
-              echo "==> Desplegando contenedor de aplicación productiva en puerto 8080..."
-              docker stop boardgames-app 2>/dev/null || true
-              docker rm boardgames-app 2>/dev/null || true
+              echo "==> Levantando stack orquestado (Spring Boot + MySQL)..."
+              docker compose down --remove-orphans || true
+              docker compose up -d
 
-              docker run -d \
-                --name boardgames-app \
-                --network app-net \
-                --restart always \
-                -p 8080:8080 \
-                -e SPRING_DATASOURCE_URL=jdbc:mysql://mysql_container:3306/$(MYSQL_DATABASE)?useSSL=false\&serverTimezone=UTC\&allowPublicKeyRetrieval=true \
-                -e SPRING_DATASOURCE_USERNAME=root \
-                -e SPRING_DATASOURCE_PASSWORD="$(MYSQL_ROOT_PASSWORD)" \
-                $(acrServer)/$(imageRepository):$IMAGE_TAG
-
-              echo "==> Despliegue en producción finalizado con éxito."
-            displayName: 'Deploy Production Containers'
+              echo "==> Orquestación completada exitosamente."
+            displayName: 'Orquestación de Contenedores con Docker Compose'
